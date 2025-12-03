@@ -126,7 +126,7 @@ def clip_by_agc(clip=0.3, pmin=1e-3):
 def scale_by_rms(beta=0.999, eps=1e-8):
 
   def init_fn(params):
-    nu = jax.tree.map(lambda t: jnp.zeros_like(t, f32), params)
+    nu = jax.tree.map(lambda t: jnp.zeros_like(t, nets.COMPUTE_DTYPE), params)
     step = jnp.zeros((), i32)
     return (step, nu)
 
@@ -146,7 +146,7 @@ def scale_by_rms(beta=0.999, eps=1e-8):
 def scale_by_momentum(beta=0.9, nesterov=False):
 
   def init_fn(params):
-    mu = jax.tree.map(lambda t: jnp.zeros_like(t, f32), params)
+    mu = jax.tree.map(lambda t: jnp.zeros_like(t, nets.COMPUTE_DTYPE), params)
     step = jnp.zeros((), i32)
     return (step, mu)
 

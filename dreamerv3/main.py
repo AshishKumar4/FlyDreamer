@@ -228,6 +228,9 @@ def make_env(config, index, **overrides):
       'pinpad': 'embodied.envs.pinpad:PinPad',
       'langroom': 'embodied.envs.langroom:LangRoom',
       'procgen': 'embodied.envs.procgen:ProcGen',
+      'fpv': lambda task, **kw: __import__(
+          'embodied.envs.fpv', fromlist=['create_fpv_env']
+      ).create_fpv_env(**kw),
       'bsuite': 'embodied.envs.bsuite:BSuite',
       'memmaze': lambda task, **kw: from_gym.FromGym(
           f'MemoryMaze-{task}-v0', **kw),

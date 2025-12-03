@@ -10,6 +10,7 @@ import numpy as np
 from jax.sharding import PartitionSpec as P
 
 from . import nets
+from .transform import _compat_jit
 
 
 def setup(
@@ -61,7 +62,7 @@ def setup(
     # os.environ['NCCL_NVLS_ENABLE'] = '0'
     # os.environ['CUDA_MODULE_LOADING'] = 'EAGER'
     xlaflags += [
-        '--xla_disable_hlo_passes=rematerialization',
+        # '--xla_disable_hlo_passes=rematerialization',
         '--xla_gpu_all_gather_combine_threshold_bytes=134217728',
         '--xla_gpu_all_reduce_combine_threshold_bytes=134217728',
         '--xla_gpu_enable_all_gather_combine_by_dim=false',
@@ -277,9 +278,17 @@ def ckpt_fn(params, compile=True):
   keys = params.keys()
   original = {k: params[k].sharding for k in keys}
   inspec = {k: struct(params[k], original[k]) for k in keys}
-  gather_fn = jax.jit(lambda x: x, (original,), mirrored).lower(inspec)
+  gather_fn = _compat_jit(
+      lambda x: x,
+      in_shardings=(original,),
+      out_shardings=mirrored,
+  ).lower(inspec)
   inspec = {k: struct(params[k], mirrored) for k in keys}
-  shard_fn = jax.jit(lambda x: x, (mirrored,), original).lower(inspec)
+  shard_fn = _compat_jit(
+      lambda x: x,
+      in_shardings=(mirrored,),
+      out_shardings=original,
+  ).lower(inspec)
   if compile:
     gather_fn = gather_fn.compile()
     shard_fn = shard_fn.compile()
@@ -301,4 +310,3 @@ def ckpt_fn(params, compile=True):
 #       'model_node_rank': model_node_rank,
 #       'model_node_size': model_node_size,
 #   }
-

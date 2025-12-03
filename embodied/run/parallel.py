@@ -8,6 +8,9 @@ import elements
 import embodied
 import numpy as np
 import portal
+from tqdm import tqdm
+
+from embodied.run.video_utils import VideoRecorder
 
 prefix = lambda d, p: {f'{p}/{k}': v for k, v in d.items()}
 
@@ -329,20 +332,36 @@ def parallel_logger(make_logger, args):
   cp.step = logger.step
   cp.load_or_save()
 
+  # Create progress bar
+  pbar = tqdm(total=args.steps, dynamic_ncols=True, desc='Train', initial=int(logger.step))
+
   parallel = elements.Agg()
   epstats = elements.Agg()
   episodes = collections.defaultdict(elements.Agg)
   updated = collections.defaultdict(lambda: None)
   dones = collections.defaultdict(lambda: True)
 
+  # Progress bar state
+  last_score = {'score': '-', 'length': '-'}
+  last_loss = '-'
+  policy_fps = elements.FPS()
+
   @elements.timer.section('addfn')
   def addfn(metrics):
+    nonlocal last_loss
     active.increment()
     logger.add(metrics)
+    # Extract loss for progress bar
+    if 'train/opt/loss' in metrics:
+      loss_val = float(metrics['train/opt/loss'])
+      if np.isfinite(loss_val):
+        last_loss = f"{loss_val:.1f}"
 
   @elements.timer.section('tranfn')
   def tranfn(trans):
+    nonlocal last_score
     active.increment()
+    policy_fps.step(trans['is_first'].size)
     now = time.time()
     envid = trans.pop('envid')
     logger.step.increment((~trans['is_eval']).sum())
@@ -375,9 +394,13 @@ def parallel_logger(make_logger, args):
           episode.add(key + '/sum', value, agg='sum')
       if tran['is_last']:
         result = episode.result()
+        ep_score = result.pop('score')
+        ep_length = result.pop('length') - 1
+        # Update progress bar state
+        last_score = {'score': f"{ep_score:.1f}", 'length': str(int(ep_length))}
         logger.add({
-            'score': result.pop('score'),
-            'length': result.pop('length') - 1,
+            'score': ep_score,
+            'length': ep_length,
         }, prefix='episode')
         rew = result.pop('rewards')
         if len(rew) > 1:
@@ -397,6 +420,17 @@ def parallel_logger(make_logger, args):
   last_step = int(logger.step)
   while True:
     time.sleep(1)
+
+    # Update progress bar
+    pbar.n = int(logger.step)
+    pbar.set_postfix({
+        'score': last_score.get('score', '-'),
+        'len': last_score.get('length', '-'),
+        'loss': last_loss,
+        'fps': f"{policy_fps.result():.1f}",
+    })
+    pbar.refresh()
+
     if should_log() and active > 0:
       active.reset()
       with elements.timer.section('metrics'):
@@ -432,6 +466,13 @@ def parallel_env(make_env, envid, args, is_eval=False):
   actor = portal.Client(args.actor_addr, name, autoconn=False)
   actor.connect()
 
+  # Video recording (only for first env)
+  video_recorder = VideoRecorder(
+      elements.Path(args.logdir),
+      video_every=getattr(args, 'video_every', 5000),
+      enabled=(envid == 0))
+  step_counter = 0
+
   done = True
   while True:
 
@@ -448,9 +489,13 @@ def parallel_env(make_env, envid, args, is_eval=False):
     score += obs['reward']
     length += 1
     fps.step(1)
+    step_counter += 1
     done = obs['is_last']
     if done and envid == 0:
       print(f'Episode of length {length} with score {score:.2f}')
+
+    # Video recording
+    video_recorder.on_step(step_counter, env, obs, print_fn=print)
 
     try:
       with elements.timer.section('request'):

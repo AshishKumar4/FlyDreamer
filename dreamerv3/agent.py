@@ -67,20 +67,38 @@ class Agent(embodied.jax.Agent):
         embodied.jax.MLPHead(scalar, **config.value, name='slowval'),
         source=self.val, **config.slowvalue)
 
+    # Auxiliary heads: predict state/goal from latent (SkyDreamer-style)
+    state_space = elements.Space(np.float32, (13,))
+    goal_space = elements.Space(np.float32, (4,))
+    self.aux_state = embodied.jax.MLPHead(
+        state_space, **config.aux_state_head, name='aux_state')
+    self.aux_goal = embodied.jax.MLPHead(
+        goal_space, **config.aux_goal_head, name='aux_goal')
+
     self.retnorm = embodied.jax.Normalize(**config.retnorm, name='retnorm')
     self.valnorm = embodied.jax.Normalize(**config.valnorm, name='valnorm')
     self.advnorm = embodied.jax.Normalize(**config.advnorm, name='advnorm')
 
-    self.modules = [
-        self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
-    self.opt = embodied.jax.Optimizer(
-        self.modules, self._make_opt(**config.opt), summary_depth=1,
-        name='opt')
-
+    # Configure loss scales (aux scales handled separately for dynamic addition)
     scales = self.config.loss_scales.copy()
     rec = scales.pop('rec')
     scales.update({k: rec for k in dec_space})
+    self.aux_state_scale = scales.pop('aux_state', 0.0)
+    self.aux_goal_scale = scales.pop('aux_goal', 0.0)
     self.scales = scales
+
+    # Include aux heads in optimizer only when active (scale > 0)
+    self.modules = [
+        self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val,
+    ]
+    if self.aux_state_scale > 0:
+      self.modules.append(self.aux_state)
+    if self.aux_goal_scale > 0:
+      self.modules.append(self.aux_goal)
+
+    self.opt = embodied.jax.Optimizer(
+        self.modules, self._make_opt(**config.opt), summary_depth=1,
+        name='opt')
 
   @property
   def policy_keys(self):
@@ -181,6 +199,21 @@ class Agent(embodied.jax.Agent):
       target = f32(value) / 255 if isimage(space) else value
       losses[key] = recon.loss(sg(target))
 
+    # Auxiliary state/goal prediction
+    dynamic_scales = self.scales.copy()
+    aux_inp = self.feat2tensor(repfeat)
+    if 'state' in obs and self.aux_state_scale > 0:
+      losses['aux_state'] = self.aux_state(aux_inp, 2).loss(obs['state'])
+      dynamic_scales['aux_state'] = self.aux_state_scale
+      state_pred = self.aux_state(aux_inp, 2).pred()
+      metrics['aux/state_mse'] = ((state_pred - obs['state']) ** 2).mean()
+    if 'goal' in obs and self.aux_goal_scale > 0:
+      losses['aux_goal'] = self.aux_goal(aux_inp, 2).loss(obs['goal'])
+      dynamic_scales['aux_goal'] = self.aux_goal_scale
+      goal_pred = self.aux_goal(aux_inp, 2).pred()
+      metrics['aux/goal_mse'] = ((goal_pred - obs['goal']) ** 2).mean()
+      metrics['aux/dist_error'] = jnp.abs(goal_pred[..., 3] - obs['goal'][..., 3]).mean()
+
     B, T = reset.shape
     shapes = {k: v.shape for k, v in losses.items()}
     assert all(x == (B, T) for x in shapes.values()), ((B, T), shapes)
@@ -234,10 +267,8 @@ class Agent(embodied.jax.Agent):
       losses.update(los)
       metrics.update(prefix(mets, 'reploss'))
 
-    assert set(losses.keys()) == set(self.scales.keys()), (
-        sorted(losses.keys()), sorted(self.scales.keys()))
     metrics.update({f'loss/{k}': v.mean() for k, v in losses.items()})
-    loss = sum([v.mean() * self.scales[k] for k, v in losses.items()])
+    loss = sum([v.mean() * dynamic_scales[k] for k, v in losses.items()])
 
     carry = (enc_carry, dyn_carry, dec_carry)
     entries = (enc_entries, dyn_entries, dec_entries)
@@ -250,7 +281,7 @@ class Agent(embodied.jax.Agent):
 
     carry, obs, prevact, _ = self._apply_replay_context(carry, data)
     (enc_carry, dyn_carry, dec_carry) = carry
-    B, T = obs['is_first'].shape
+    B, T_seq = obs['is_first'].shape
     RB = min(6, B)
     metrics = {}
 
@@ -271,15 +302,15 @@ class Agent(embodied.jax.Agent):
           print(f'Skipping gradnorm summary for missing loss: {key}')
 
     # Open loop
-    firsthalf = lambda xs: jax.tree.map(lambda x: x[:RB, :T // 2], xs)
-    secondhalf = lambda xs: jax.tree.map(lambda x: x[:RB, T // 2:], xs)
+    firsthalf = lambda xs: jax.tree.map(lambda x: x[:RB, :T_seq // 2], xs)
+    secondhalf = lambda xs: jax.tree.map(lambda x: x[:RB, T_seq // 2:], xs)
     dyn_carry = jax.tree.map(lambda x: x[:RB], dyn_carry)
     dec_carry = jax.tree.map(lambda x: x[:RB], dec_carry)
     dyn_carry, _, obsfeat = self.dyn.observe(
         dyn_carry, firsthalf(outs['tokens']), firsthalf(prevact),
         firsthalf(obs['is_first']), training=False)
     _, imgfeat, _ = self.dyn.imagine(
-        dyn_carry, secondhalf(prevact), length=T - T // 2, training=False)
+        dyn_carry, secondhalf(prevact), length=T_seq - T_seq // 2, training=False)
     dec_carry, _, obsrecons = self.dec(
         dec_carry, obsfeat, firsthalf(obs['is_first']), training=False)
     dec_carry, _, imgrecons = self.dec(
@@ -297,13 +328,18 @@ class Agent(embodied.jax.Agent):
 
       video = jnp.pad(video, [[0, 0], [0, 0], [2, 2], [2, 2], [0, 0]])
       mask = jnp.zeros(video.shape, bool).at[:, :, 2:-2, 2:-2, :].set(True)
-      border = jnp.full((T, 3), jnp.array([0, 255, 0]), jnp.uint8)
-      border = border.at[T // 2:].set(jnp.array([255, 0, 0], jnp.uint8))
+      C = video.shape[-1]
+      if C == 1:
+        border = jnp.full((T_seq, 1), 128, jnp.uint8)
+        border = border.at[T_seq // 2:].set(64)
+      else:
+        border = jnp.full((T_seq, C), jnp.array([0, 255, 0])[:C], jnp.uint8)
+        border = border.at[T_seq // 2:].set(jnp.array([255, 0, 0])[:C])
       video = jnp.where(mask, video, border[None, :, None, None, :])
       video = jnp.concatenate([video, 0 * video[:, :10]], 1)
 
-      B, T, H, W, C = video.shape
-      grid = video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C))
+      B_v, T_v, H, W, C = video.shape
+      grid = video.transpose((1, 2, 0, 3, 4)).reshape((T_v, H, B_v * W, C))
       metrics[f'openloop/{key}'] = grid
 
     carry = (*new_carry, {k: data[k][:, -1] for k in self.act_space})

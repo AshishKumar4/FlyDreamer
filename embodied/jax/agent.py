@@ -23,6 +23,7 @@ class Options:
 
   policy_devices: tuple = (0,)
   train_devices: tuple = (0,)
+  policy_on_cpu: bool = False
   policy_mesh: str = '-1,1,1'
   train_mesh: str = '-1,1,1'
   profiler: bool = True
@@ -80,9 +81,16 @@ class Agent(embodied.Agent):
     flatten = lambda x: x.reshape(-1).tolist()
     devices = np.array(available).reshape(
         jax.process_count(), jax.local_device_count())
-    self.policy_devices = flatten(devices[:, self.jaxcfg.policy_devices])
+
+    # Use CPU devices for policy if policy_on_cpu is enabled
+    if self.jaxcfg.policy_on_cpu:
+      self.policy_devices = jax.devices('cpu')
+      print('Policy devices (CPU):', ', '.join([str(x) for x in self.policy_devices]))
+    else:
+      self.policy_devices = flatten(devices[:, self.jaxcfg.policy_devices])
+      print('Policy devices:', ', '.join([str(x) for x in self.policy_devices]))
+
     self.train_devices = flatten(devices[:, self.jaxcfg.train_devices])
-    print('Policy devices:', ', '.join([str(x) for x in self.policy_devices]))
     print('Train devices: ', ', '.join([str(x) for x in self.train_devices]))
 
     # d = DP, f = FSDP, t = TP
@@ -172,13 +180,15 @@ class Agent(embodied.Agent):
 
     self._split = jax.jit(
         lambda xs: jax.tree.map(lambda x: list(x), xs),
-        internal.local_sharding(self.policy_sharded),
-        internal.local_sharding(self.policy_mirrored))
+        in_shardings=internal.local_sharding(self.policy_sharded),
+        out_shardings=internal.local_sharding(self.policy_mirrored),
+    )
     self._stack = jax.jit(
         lambda xs: jax.tree.map(
             jnp.stack, xs, is_leaf=lambda x: isinstance(x, list)),
-        internal.local_sharding(self.policy_mirrored),
-        internal.local_sharding(self.policy_sharded))
+        in_shardings=internal.local_sharding(self.policy_mirrored),
+        out_shardings=internal.local_sharding(self.policy_sharded),
+    )
 
     self._ckpt_groups = internal.grouped_ckpt_fns(
         self.params, self.jaxcfg.ckpt_chunksize)

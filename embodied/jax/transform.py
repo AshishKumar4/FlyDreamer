@@ -53,7 +53,13 @@ def init(
   if print_partition:
     print_grouping(grouping)
 
-  fn = jax.jit(fn, arg_shardings, params_sharding, static_argnums, None)
+  fn = _compat_jit(
+      fn,
+      in_shardings=arg_shardings,
+      out_shardings=params_sharding,
+      static_argnums=static_argnums,
+      donate_argnums=None,
+  )
   params = fn(*dummy_inputs)
 
   return params, params_sharding
@@ -129,9 +135,31 @@ def apply(
         nn.LAYER_CALLBACK = old
       return outs
 
-  fn = jax.jit(fn, in_shardings, out_shardings, static_argnums, None, donate)
+  fn = _compat_jit(
+      fn,
+      in_shardings=in_shardings,
+      out_shardings=out_shardings,
+      static_argnums=static_argnums,
+      donate_argnums=donate,
+  )
 
   return fn
+
+
+def _compat_jit(fn, in_shardings=None, out_shardings=None, static_argnums=(), donate_argnums=None):
+  """Call jax.jit with shardings if supported; fall back for older JAX."""
+  try:
+    return jax.jit(
+        fn,
+        in_shardings=in_shardings,
+        out_shardings=out_shardings,
+        static_argnums=static_argnums,
+        donate_argnums=donate_argnums,
+    )
+  except TypeError:
+    # Older JAX versions do not accept sharding args.
+    print("Warning: JAX version does not support in/out_shardings in jax.jit; falling back without sharding.")
+    return jax.jit(fn, static_argnums=static_argnums, donate_argnums=donate_argnums)
 
 
 def create_layer_callback(mesh, partition_rules):
